@@ -1,0 +1,129 @@
+--- a/crates/latticefold-plus/src/rgchk.rs
++++ b/crates/latticefold-plus/src/rgchk.rs
+@@ -430,4 +430,125 @@
+         let mut ts = PoseidonTranscript::empty::<PC>();
+         dcom.verify(&mut ts).unwrap();
+     }
+-}
++
++    // Security regression: the committed auxiliary digits need not be the
++    // deterministic decomposition D_f required by the printed source relation.
++    // For d=16, d'=8: 1 = (-7) + 8*1, with both digits in (-8,8).
++    fn noncanonical_digit_instance(kappa: usize) -> (Rg<R>, Matrix<R>) {
++        let n = 1 << 15;
++        let d = R::dimension();
++        assert_eq!(d, 16);
++        let b = (d / 2) as u128;
++        let k = 2;
++        let l = ((<<R as PolyRing>::BaseRing>::MODULUS.0[0] as f64).ln()
++            / ((d / 2) as f64).ln())
++        .ceil() as usize;
++        let dparams = DecompParameters { b, k, l };
++
++        let mut f = vec![R::zero(); n];
++        f[0].coeffs_mut()[0] = 1u128.into();
++        let a = Matrix::<R>::rand(&mut ark_std::test_rng(), kappa, n);
++        let mut inst = RgInstance::from_f(f.clone(), &a, &dparams);
++
++        // For the deterministic signed decomposition, 1 -> (1, 0).
++        let x = stark_rings::unit_monomial::<R>(1);
++        let x9 = stark_rings::unit_monomial::<R>(9); // exp(-7) in X^16+1
++        assert_eq!(inst.M_f[0].vals[0][0], x);
++        assert_ne!(inst.M_f[1].vals[0][0], x);
++        assert_ne!(inst.M_f[0].vals[0][0], x9);
++
++        // The alternate signed digits (-7, 1) still reconstruct 1 exactly.
++        let lifted_base = R::from(<R as PolyRing>::BaseRing::from(b));
++        let reconstructed = (psi::<R>() * (x9 + lifted_base * x)).ct();
++        assert_eq!(reconstructed, 1u128.into());
++        assert_eq!((psi::<R>() * x9).ct(), -(<R as PolyRing>::BaseRing::from(7u128)));
++        assert_eq!((psi::<R>() * x).ct(), 1u128.into());
++
++        // Change ONLY the committed digit matrix, not f or its commitment.
++        inst.M_f[0].vals[0][0] = x9;
++        inst.M_f[1].vals[0][0] = x;
++        inst.comM_f = inst
++            .M_f
++            .iter()
++            .map(|m| a.try_mul_mat(m).unwrap())
++            .collect();
++        let com_m = Matrix::hconcat(&inst.comM_f).unwrap();
++        inst.tau = split(&com_m, n, b, l);
++        inst.m_tau = inst.tau.iter().map(|&z| exp::<R>(z).unwrap()).collect();
++        let tau_ring = inst.tau.iter().map(|&z| R::from(z)).collect::<Vec<R>>();
++        inst.fcoms = FComs {
++            cm_f: a.try_mul_vec(&inst.f).unwrap(),
++            C_Mf: a.try_mul_vec(&tau_ring).unwrap(),
++            cm_mtau: a.try_mul_vec(&inst.m_tau).unwrap(),
++        };
++
++        // Check all three public commitments independently.
++        assert_eq!(inst.fcoms.cm_f, a.try_mul_vec(&f).unwrap());
++        assert_eq!(inst.fcoms.C_Mf, a.try_mul_vec(&tau_ring).unwrap());
++        assert_eq!(inst.fcoms.cm_mtau, a.try_mul_vec(&inst.m_tau).unwrap());
++        assert_eq!(inst.M_f[0].vals[0][0], x9);
++        assert_eq!(inst.M_f[1].vals[0][0], x);
++
++        (
++            Rg {
++                nvars: log2(n) as usize,
++                instances: vec![inst],
++                dparams,
++            },
++            a,
++        )
++    }
++
++    #[test]
++    fn attack_noncanonical_digit_range_check() {
++        let (rg, _a) = noncanonical_digit_instance(1);
++        let mut tp = PoseidonTranscript::empty::<PC>();
++        let proof = rg.range_check(&[], &mut tp);
++        let mut tv = PoseidonTranscript::empty::<PC>();
++        proof.verify(&mut tv).expect("noncanonical range proof was rejected");
++
++        // This is NOT a witness for the formally specified canonical source
++        // relation, despite the output checks being satisfied.
++        assert_eq!(rg.instances[0].M_f[0].vals[0][0], stark_rings::unit_monomial::<R>(9));
++        assert_eq!(rg.instances[0].f[0].coeffs()[0], 1u128.into());
++        println!("PLUS_NONCANONICAL_RANGE_ACCEPTED: D_f(1)=(1,0), committed (-7,1), Dcom::verify=Ok");
++    }
++
++    #[test]
++    fn attack_noncanonical_digit_commitment_transform() {
++        let (rg, a) = noncanonical_digit_instance(2);
++        let nvars = rg.nvars;
++        let cm = crate::cm::Cm { rg };
++        let mut tp = PoseidonTranscript::empty::<PC>();
++        let (folded, proof) = cm.prove(&[], &mut tp);
++        let mut tv = PoseidonTranscript::empty::<PC>();
++        let checked = proof.verify(&[], &mut tv).expect("commitment transform rejected");
++
++        assert_eq!(checked.cm_g, folded.x.cm_g);
++        assert_eq!(checked.vo, folded.x.vo);
++        assert_eq!(checked.ro, folded.x.ro);
++        assert_eq!(a.try_mul_vec(&folded.g[0]).unwrap(), folded.x.cm_g[0]);
++
++        // Independently verify the target MLE evaluation at both random points.
++        let mle = DenseMultilinearExtension::from_evaluations_vec(nvars, folded.g[0].clone());
++        let r0 = folded.x.ro.iter().map(|(x, _)| *x).collect::<Vec<R>>();
++        let r1 = folded.x.ro.iter().map(|(_, y)| *y).collect::<Vec<R>>();
++        assert_eq!(mle.evaluate(&r0).unwrap(), folded.x.vo[0][0].0);
++        assert_eq!(mle.evaluate(&r1).unwrap(), folded.x.vo[0][0].1);
++
++        // The paper's conservative norm bound is b_out/2 >= 215040 for this
++        // Frog-ring choice (d=16, operator bound <= 2048, B=8^2, dk=32).
++        let q = <<R as PolyRing>::BaseRing>::MODULUS.0[0];
++        let observed_max = folded.g[0]
++            .iter()
++            .flat_map(|r| r.coeffs().iter())
++            .map(|c| {
++                let x = (*c).into_bigint().0[0];
++                x.min(q - x)
++            })
++            .max()
++            .unwrap();
++        assert!(observed_max < 215040u64);
++        println!("PLUS_NONCANONICAL_CM_ACCEPTED: CmProof::verify=Ok, target commitment/MLE/norm valid; max coeff={observed_max}");
++    }
++}

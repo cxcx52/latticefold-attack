@@ -1,0 +1,56 @@
+--- a/crates/latticefold/src/nifs/attack_range_cancel_regression.rs
++++ b/crates/latticefold/src/nifs/attack_range_cancel_regression.rs
+@@ -91,12 +91,19 @@
+             .collect();
+         let scheme = AjtaiCommitmentScheme::<R>::new(identity_rows.into());
+         let zero_poly = first_coefficients(Fq::zero(), Fq::zero());
++        assert_eq!(P::B_SMALL, 2);
++        assert_eq!(P::B, 1u128 << P::K);
+ 
+         // Source commitment has the unique opening f_orig with coefficients
+         // (5*B/2, -4*B/2), outside the strict B-range.
+         let mut f_orig = vec![zero_poly.clone(); P::L];
+         f_orig[0] = first_coefficients(Fq::from(5u128 * (P::B / 2)), -Fq::from(4u128 * (P::B / 2)));
+         let w_orig = Witness::<R>::from_f_coeff::<P>(f_orig);
++        // Independently certify the source opening's centered coefficients:
++        // max(|5*B/2|, |4*B/2|) = 5*B/2 > B.
++        assert_eq!(w_orig.f_coeff[0].coeffs()[0], Fq::from(5u128 * (P::B / 2)));
++        assert_eq!(w_orig.f_coeff[0].coeffs()[8], -Fq::from(4u128 * (P::B / 2)));
++        assert!(5 * (P::B / 2) > P::B);
+         let cm_i = CCCS {
+             cm: w_orig.commit::<P>(&scheme).unwrap(),
+             x_ccs: vec![],
+@@ -134,6 +141,14 @@
+         let mut f_bad = vec![zero_poly.clone(); P::L];
+         f_bad[0] = first_coefficients(Fq::from(5u64), -Fq::from(4u64));
+         let w_bad = Witness::<R>::from_f_coeff::<P>(f_bad);
++        // Both channels violate the small-digit range, but the FINAL
++        // output is strictly B-short: max(|5|,|-4|) = 5 < B.
++        assert_eq!(w_bad.f_coeff[0].coeffs()[0], Fq::from(5u64));
++        assert_eq!(w_bad.f_coeff[0].coeffs()[8], -Fq::from(4u64));
++        assert!(5 >= P::B_SMALL && 5u128 < P::B);
++        // The exact integer cancellation used by the real sumcheck:
++        // P_2(5)=120, P_2(-4)=-60, so 2*120+4*(-60)=0.
++        assert_eq!(2i64 * (5i64.pow(3) - 5) + 4i64 * ((-4i64).pow(3) - (-4)), 0);
+         let w_zero = Witness::<R>::from_f_coeff::<P>(vec![zero_poly.clone(); P::L]);
+         let mut right_wits = vec![w_zero; P::K];
+         right_wits[P::K - 1] = w_bad.clone();
+@@ -199,5 +214,18 @@
+         assert_eq!(verified, folded);
+         assert_eq!(folded_witness.f, w_bad.f);
+         assert_eq!(folded.cm, w_bad.commit::<P>(&scheme).unwrap());
++        assert_eq!(folded_witness.f_coeff[0].coeffs()[0], Fq::from(5u64));
++        assert_eq!(folded_witness.f_coeff[0].coeffs()[8], -Fq::from(4u64));
++        // Independent target-relation check: recompute the MLE values
++        // from the OPENED output witness, not from the folding proof.
++        let independently_evaluated_v =
++            evaluate_mles::<R, _, _, crate::nifs::error::DecompositionError>(
++                &folded_witness.f_hat, &verified.r,
++            )
++            .unwrap();
++        assert_eq!(verified.v, independently_evaluated_v);
++        // This example uses zero CCS matrices, so the target linearized
++        // CCS claims must all be zero independently of the proof.
++        assert_eq!(verified.u, vec![R::zero(); ccs.t]);
+     }
+ }

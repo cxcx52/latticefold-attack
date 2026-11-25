@@ -1,0 +1,60 @@
+--- a/crates/latticefold/src/nifs/folding/utils.rs
++++ b/crates/latticefold/src/nifs/folding/utils.rs
+@@ -80,7 +80,7 @@
+             .map(|x| NTT::from(x))
+             .collect::<Vec<_>>(); // Note is one challenge less
+ 
+-        mu_s.push(NTT::ONE);
++        mu_s.push(NTT::ONE + NTT::ONE);
+ 
+         self.absorb_field_element(&<NTT::BaseRing as Field>::from_base_prime_field(
+             <NTT::BaseRing as Field>::BasePrimeField::from_be_bytes_mod_order(b"beta_s"),
+--- a/crates/latticefold/src/nifs/attack_range_cancel_regression.rs
++++ b/crates/latticefold/src/nifs/attack_range_cancel_regression.rs
+@@ -91,13 +91,11 @@
+             .collect();
+         let scheme = AjtaiCommitmentScheme::<R>::new(identity_rows.into());
+         let zero_poly = first_coefficients(Fq::zero(), Fq::zero());
+-        let big = Fq::from(P::B);
+-        let two = Fq::from(P::B_SMALL as u64);
+-
+-        // Source input commitment has the known opening f_orig with
+-        // coefficients (+B, -B).  It is NOT strictly B-short.
++
++        // Source commitment has the unique opening f_orig with coefficients
++        // (5*B/2, -4*B/2), outside the strict B-range.
+         let mut f_orig = vec![zero_poly.clone(); P::L];
+-        f_orig[0] = first_coefficients(big, -big);
++        f_orig[0] = first_coefficients(Fq::from(5u128 * (P::B / 2)), -Fq::from(4u128 * (P::B / 2)));
+         let w_orig = Witness::<R>::from_f_coeff::<P>(f_orig);
+         let cm_i = CCCS {
+             cm: w_orig.commit::<P>(&scheme).unwrap(),
+@@ -128,11 +126,13 @@
+             )
+             .unwrap();
+ 
+-        // Malicious split: first K-1 private digits zero; last private digit
+-        // has +b and -b in two DIFFERENT f-hat channels. Recombination is
+-        // 2^(K-1) * (+b,-b) = (+B,-B), as publicly required.
++        // Malicious split: first K-1 private digits zero; last digit has
++        // (+5,-4) in two DIFFERENT f-hat channels. Although both violate
++        // b=2, for fixed mu=2 their weighted range residual cancels:
++        // 2*P_2(5) + 4*P_2(-4) = 2*120 - 4*60 = 0.
++        // Reconstruction is 2^(K-1)*(+5,-4), matching f_orig.
+         let mut f_bad = vec![zero_poly.clone(); P::L];
+-        f_bad[0] = first_coefficients(two, -two);
++        f_bad[0] = first_coefficients(Fq::from(5u64), -Fq::from(4u64));
+         let w_bad = Witness::<R>::from_f_coeff::<P>(f_bad);
+         let w_zero = Witness::<R>::from_f_coeff::<P>(vec![zero_poly.clone(); P::L]);
+         let mut right_wits = vec![w_zero; P::K];
+@@ -170,8 +170,8 @@
+         mz.extend(vec![vec![zero_mle; ccs.t]; P::K]);
+ 
+         // This is the real folding prover on deliberately illegal b-digits.
+-        // Its norm-check polynomial is zero because the last MU is fixed 1
+-        // and the two nonzero channels are additive inverses.
++        // Its norm-check has ZERO BOOLEAN SUM for fixed mu=2, although the
++        // corresponding multivariate polynomial need not vanish identically.
+         let (folded, folded_witness, folding_proof) =
+             LFFoldingProver::<R, T>::prove::<P>(
+                 &lcccs_l, wit_l, &mut tp, &ccs, &mz,

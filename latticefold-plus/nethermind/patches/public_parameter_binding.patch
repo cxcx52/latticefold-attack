@@ -1,0 +1,26 @@
+diff --git a/crates/latticefold-plus/src/plus.rs b/crates/latticefold-plus/src/plus.rs
+--- a/crates/latticefold-plus/src/plus.rs
++++ b/crates/latticefold-plus/src/plus.rs
+@@ -210,9 +210,21 @@
+ 
+         let proof = prover.prove(&[cr1cs0, cr1cs1]);
+ 
++        // Negative-setup regression: change only the public Ajtai matrix.
++        // A verifier for a fixed commitment setup must not accept this proof
++        // without checking the committed input against the new matrix.
++        let mut wrong_A = A.clone();
++        wrong_A.vals[0][0] += R::ONE;
++        assert_ne!(wrong_A.vals[0][0], A.vals[0][0]);
++        let wrong_transcript = PoseidonTranscript::empty::<PC>();
++        let mut wrong_verifier =
++            PlusVerifier::init(wrong_A, M.clone(), pparams.clone(), wrong_transcript);
++        assert!(wrong_verifier.verify(&proof));
++        eprintln!("PLUS_WRONG_A_ACCEPTED: changed Ajtai matrix, proof unchanged");
++
+         let transcript = PoseidonTranscript::empty::<PC>();
+         let mut verifier = PlusVerifier::init(A, M, pparams, transcript);
+-        verifier.verify(&proof);
++        assert!(verifier.verify(&proof));
+     }
+ 
+     #[test]

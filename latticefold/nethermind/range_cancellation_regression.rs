@@ -1,0 +1,203 @@
+//! Security regression: non-short final digit can evade the shared-MU range sumcheck.
+//! This constructs a malicious *decomposition proof* rather than invoking the honest
+//! decomposition algorithm, because a malicious prover is not bound to that algorithm.
+//! The test checks the actual NIFSVerifier::verify entry point.
+
+#[cfg(test)]
+mod tests {
+    use ark_ff::{One, Zero};
+    use cyclotomic_rings::rings::{
+        GoldilocksChallengeSet, GoldilocksRingNTT, GoldilocksRingPoly,
+    };
+    use stark_rings::{cyclotomic_ring::models::goldilocks::Fq, PolyRing};
+    use stark_rings_linalg::SparseMatrix;
+    use stark_rings_poly::mle::DenseMultilinearExtension;
+
+    use crate::{
+        arith::{r1cs::R1CS, Witness, CCCS, CCS, LCCCS},
+        commitment::AjtaiCommitmentScheme,
+        decomposition_parameters::{test_params::GoldilocksDP, DecompositionParams},
+        nifs::{
+            decomposition::{
+                DecompositionProof, DecompositionProver, DecompositionVerifier,
+                LFDecompositionProver, LFDecompositionVerifier,
+            },
+            folding::{FoldingProver, LFFoldingProver},
+            linearization::{LFLinearizationProver, LinearizationProver},
+            LFProof, NIFSVerifier,
+        },
+        transcript::{poseidon::PoseidonTranscript, Transcript},
+        utils::mle_helpers::evaluate_mles,
+    };
+
+    type R = GoldilocksRingNTT;
+    type P = GoldilocksDP;
+    type T = PoseidonTranscript<R, GoldilocksChallengeSet>;
+
+    fn first_coefficients(a0: Fq, a8: Fq) -> GoldilocksRingPoly {
+        // Goldilocks's coefficient ring has degree 24; each of the three
+        // f-hat channels stores eight consecutive original coefficients.
+        let mut a = vec![Fq::zero(); GoldilocksRingPoly::dimension()];
+        a[0] = a0;
+        a[8] = a8;
+        GoldilocksRingPoly::from(a)
+    }
+
+    #[test]
+    fn ajtai_rand_has_trivial_short_collision() {
+        // Rust vec![expr; n] clones one evaluation, even when expr is random.
+        let mut rng = ark_std::test_rng();
+        let scheme = AjtaiCommitmentScheme::<R>::rand(4, 5, &mut rng);
+        let mut u = vec![R::zero(); 5];
+        let mut v = vec![R::zero(); 5];
+        u[0] = R::one();
+        v[1] = R::one();
+        let cu = scheme.commit_ntt(&u).unwrap();
+        let cv = scheme.commit_ntt(&v).unwrap();
+        // This equality proves a norm-one nonzero kernel vector e0-e1.
+        assert_eq!(cu, cv);
+    }
+
+    #[test]
+    fn nifs_verifier_accepts_illegal_last_digit_by_range_cancellation() {
+        let m = 8;
+        let zero_m = SparseMatrix::<R> {
+            nrows: m,
+            ncols: 2,
+            coeffs: vec![vec![]; m],
+        };
+        let ccs = CCS::<R>::from_r1cs_padded(
+            R1CS {
+                l: 0,
+                A: zero_m.clone(),
+                B: zero_m.clone(),
+                C: zero_m,
+            },
+            m,
+            P::L,
+        );
+        assert_eq!(ccs.m, m);
+        assert_eq!(ccs.n, 2);
+        assert_eq!(ccs.t, 3);
+
+        // Use INFORMATION-THEORETICALLY BINDING A=I here, instead of the
+        // broken AjtaiCommitmentScheme::rand generator, to ensure the source
+        // has no other B-short opening.  This also tests the folding core in
+        // isolation from any computational MSIS premise.
+        let identity_rows: Vec<Vec<R>> = (0..P::L)
+            .map(|i| (0..P::L)
+                .map(|j| if i == j { R::one() } else { R::zero() })
+                .collect())
+            .collect();
+        let scheme = AjtaiCommitmentScheme::<R>::new(identity_rows.into());
+        let zero_poly = first_coefficients(Fq::zero(), Fq::zero());
+        let big = Fq::from(P::B);
+        let two = Fq::from(P::B_SMALL as u64);
+
+        // Source input commitment has the known opening f_orig with
+        // coefficients (+B, -B).  It is NOT strictly B-short.
+        let mut f_orig = vec![zero_poly.clone(); P::L];
+        f_orig[0] = first_coefficients(big, -big);
+        let w_orig = Witness::<R>::from_f_coeff::<P>(f_orig);
+        let cm_i = CCCS {
+            cm: w_orig.commit::<P>(&scheme).unwrap(),
+            x_ccs: vec![],
+        };
+        assert_eq!(cm_i.cm.as_ref(), &w_orig.f[..]);
+        // Its only opening under A=I is the explicitly non-B-short f_orig.
+        // In the original ring, centered coefficients ±B violate ||f|| < B.
+
+        let w_acc = Witness::<R>::from_f_coeff::<P>(vec![zero_poly.clone(); P::L]);
+        let acc = LCCCS {
+            r: vec![R::zero(); ccs.s],
+            v: vec![R::zero(); 3],
+            cm: w_acc.commit::<P>(&scheme).unwrap(),
+            u: vec![R::zero(); ccs.t],
+            x_w: vec![],
+            h: R::zero(),
+        };
+
+        // These prover stages can be simulated by a malicious prover.
+        let mut tp = T::default();
+        super::super::absorb_public_input::<R>(&acc, &cm_i, &mut tp);
+        let (lin_cm, linearization_proof) =
+            LFLinearizationProver::<R, T>::prove(&cm_i, &w_orig, &mut tp, &ccs).unwrap();
+        let (mz_l, mut lcccs_l, mut wit_l, decomposition_proof_l) =
+            LFDecompositionProver::<R, T>::prove::<P>(
+                &acc, &w_acc, &mut tp, &ccs, &scheme,
+            )
+            .unwrap();
+
+        // Malicious split: first K-1 private digits zero; last private digit
+        // has +b and -b in two DIFFERENT f-hat channels. Recombination is
+        // 2^(K-1) * (+b,-b) = (+B,-B), as publicly required.
+        let mut f_bad = vec![zero_poly.clone(); P::L];
+        f_bad[0] = first_coefficients(two, -two);
+        let w_bad = Witness::<R>::from_f_coeff::<P>(f_bad);
+        let w_zero = Witness::<R>::from_f_coeff::<P>(vec![zero_poly.clone(); P::L]);
+        let mut right_wits = vec![w_zero; P::K];
+        right_wits[P::K - 1] = w_bad.clone();
+
+        let y_s = right_wits
+            .iter()
+            .map(|w| w.commit::<P>(&scheme).unwrap())
+            .collect();
+        let v_s = right_wits
+            .iter()
+            .map(|w| evaluate_mles::<R, _, _, crate::nifs::error::DecompositionError>(
+                &w.f_hat, &lin_cm.r,
+            ).unwrap())
+            .collect();
+        // CCS matrices are all zero, so all native linearization values are 0.
+        let u_s = vec![vec![R::zero(); ccs.t]; P::K];
+        let mut x_s = vec![vec![R::zero()]; P::K];
+        x_s[0][0] = R::one(); // the homogenizing coordinate h=1
+        let decomposition_proof_r = DecompositionProof { u_s, v_s, x_s, y_s };
+
+        // Reuse the REAL decomposition verifier to check/publicly absorb the
+        // malicious split proof and create exactly its public digit instances.
+        let lcccs_r = LFDecompositionVerifier::<R, T>::verify::<P>(
+            &lin_cm, &decomposition_proof_r, &mut tp, &ccs,
+        )
+        .unwrap();
+        lcccs_l.extend(lcccs_r);
+        wit_l.extend(right_wits);
+
+        let mut mz = mz_l;
+        let zero_mle = DenseMultilinearExtension::<R>::from_evaluations_vec(
+            ccs.s, vec![R::zero(); ccs.m],
+        );
+        mz.extend(vec![vec![zero_mle; ccs.t]; P::K]);
+
+        // This is the real folding prover on deliberately illegal b-digits.
+        // Its norm-check polynomial is zero because the last MU is fixed 1
+        // and the two nonzero channels are additive inverses.
+        let (folded, folded_witness, folding_proof) =
+            LFFoldingProver::<R, T>::prove::<P>(
+                &lcccs_l, wit_l, &mut tp, &ccs, &mz,
+            )
+            .unwrap();
+
+        let proof = LFProof {
+            linearization_proof,
+            decomposition_proof_l,
+            decomposition_proof_r,
+            folding_proof,
+        };
+        let mut tv = T::default();
+        let result = NIFSVerifier::<R, P, T>::verify(
+            &acc, &cm_i, &proof, &mut tv, &ccs,
+        );
+
+        // A successful execution demonstrates a false-to-true reduction:
+        // Here the original source has NO valid B-short opening, because
+        // A=I has a unique opening, namely f_orig with coefficients ±B.
+        // The output is the B-short f_bad and hence is truly false-to-true.
+        let verified = result.expect(
+            "NIFS verifier rejected this would-be exploit; investigate the cause",
+        );
+        assert_eq!(verified, folded);
+        assert_eq!(folded_witness.f, w_bad.f);
+        assert_eq!(folded.cm, w_bad.commit::<P>(&scheme).unwrap());
+    }
+}

@@ -1,0 +1,82 @@
+diff --git a/crates/latticefold-plus/src/r1cs.rs b/crates/latticefold-plus/src/r1cs.rs
+index db9def4..07656a2 100644
+--- a/crates/latticefold-plus/src/r1cs.rs
++++ b/crates/latticefold-plus/src/r1cs.rs
+@@ -230,4 +230,77 @@ mod tests {
+         let mut ts = PoseidonTranscript::empty::<PC>();
+         lproof.verify(&mut ts);
+     }
++
++
++    // Adversarial regression for Appendix A: the claimed public x[1] is 1,
++    // whereas the committed opening uses z[1]=0. The R1CS constraint is
++    // z[1]=0, so no witness can satisfy x[1]=1 and the R1CS simultaneously.
++    // The test deliberately checks the target linear relation independently.
++    #[test]
++    fn attack_appendix_a_public_input_unbound() {
++        use crate::r1cs::r1cs_decomposed_square;
++        use stark_rings::balanced_decomposition::GadgetDecompose;
++
++        let n = 1 << 7;
++        let k = 4;
++        let m = n / k;
++        let b = 2_u128;
++        let kappa = 2;
++
++        // Original R1CS constraint: 0*0 = z[1].
++        // It is incompatible with the required public z[1] = 1.
++        let mut zero = SparseMatrix::<R>::identity(m);
++        for row in zero.coeffs.iter_mut() {
++            row.clear();
++        }
++        let mut select_public = zero.clone();
++        select_public.coeffs[0].push((R::one(), 1));
++        let r1cs = R1CS::<R> {
++            l: 1,
++            A: zero.clone(),
++            B: zero,
++            C: select_public,
++        };
++        let r1cs = r1cs_decomposed_square(r1cs, n, b, k);
++
++        // A real opening with correct constant coordinate z[0]=1 but z[1]=0.
++        let mut z_opening = vec![<R as ark_std::Zero>::zero(); m];
++        z_opening[0] = R::one();
++        let A = Matrix::<R>::rand(&mut ark_std::test_rng(), kappa, n);
++        let mut source = ComR1CS::new(r1cs.clone(), z_opening, 1, b, k, &A);
++        assert!(r1cs.check_relation(&source.f).is_ok());
++        assert_eq!(source.x.cm_f, A.try_mul_vec(&source.f).unwrap());
++
++        // Change the PUBLIC claimed input, not the committed opening.
++        // The source R1CS instance is now false, regardless of witness or A.
++        source.x.z[1] = R::one();
++        assert_eq!(source.x.z[0], R::one());
++        assert_eq!(source.x.z[1], R::one());
++        let claimed_f = source.x.z.gadget_decompose(b, k);
++        assert!(r1cs.check_relation(&claimed_f).is_err());
++        // In fact, the first gate demands z[1]=0 for *all* openings,
++        // whereas the public instance demands z[1]=1.
++
++        let mut prover_transcript = PoseidonTranscript::empty::<PC>();
++        let (out, proof) = source.linearize(&mut prover_transcript);
++
++        let mut verifier_transcript = PoseidonTranscript::empty::<PC>();
++        assert!(proof.verify(&mut verifier_transcript));
++
++        // Independently check target commitment and all 4 target evaluations.
++        assert_eq!(out.x.cm_f, A.try_mul_vec(&out.f).unwrap());
++        let r: Vec<R> = out.x.r.iter().map(|pair| pair.0).collect();
++        assert_eq!(out.x.v.len(), 4);
++        let mut evaluations = vec![out.f.clone()];
++        for M in source.x.matrices() {
++            evaluations.push(M.try_mul_vec(&out.f).unwrap());
++        }
++        for (i, values) in evaluations.into_iter().enumerate() {
++            let ext = DenseMultilinearExtension::from_evaluations_vec(proof.nvars, values);
++            let evaluation = ext.evaluate(&r).unwrap();
++            assert_eq!(out.x.v[i].0, evaluation);
++            assert_eq!(out.x.v[i].1, evaluation);
++        }
++        println!("APPENDIX_A_PUBLIC_INPUT_UNBOUND_ACCEPTED: false public R1CS -> valid linear target");
++    }
+ }
